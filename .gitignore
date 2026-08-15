@@ -1,0 +1,24 @@
+# Python / Virtual Environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+
+# Environment configuration
+.env
+
+# Logs
+*.log
+*.jsonl
+# State directory
+state/
+
+# IDE / Tool settings
+.claude/
+.idea/
+.vscode/
+
+# VS Code Extension packages
+*.vsix

@@ -1,0 +1,26 @@
+{
+  "name": "antigravity-prompt-bridge",
+  "displayName": "Antigravity Prompt Bridge",
+  "description": "Local HTTP bridge server to send prompts directly into Antigravity IDE without focus stealing",
+  "version": "1.0.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravityBridge.startServer",
+        "title": "Antigravity Bridge: Start Server"
+      }
+    ]
+  }
+}
