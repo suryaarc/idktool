@@ -308,8 +308,8 @@ def describe(step_type: int, status: int, leaves, raw: bool) -> tuple[str, list[
     # Report", f20.f1 = the actual 5543-char report. So prefer the answer here, and
     # fall back to the reasoning only while the answer is still empty (mid-stream).
     if STEP_ROLES.get(step_type) == "assistant":
-        answer = find_leaf(leaves, "f20.f1") or find_leaf(leaves, "f20.f8")
-        thinking = find_leaf(leaves, "f20.f3")
+        answer = find_leaf(leaves, "f20.f1", value_type="text") or find_leaf(leaves, "f20.f8", value_type="text")
+        thinking = find_leaf(leaves, "f20.f3", value_type="text")
         if answer:
             return "assistant", [str(answer)]
         if thinking:

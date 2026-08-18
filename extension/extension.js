@@ -1,6 +1,5 @@
 const http = require('http');
 const vscode = require('vscode');
-const { handlePickerRequest } = require('./pickerHandler');
 const lsClient = require('./lsClient');
 
 let server = null;
@@ -26,10 +25,17 @@ function activate(context) {
             let body = '';
             req.on('data', chunk => { body += chunk; });
             req.on('end', async () => {
+                let data;
                 try {
-                    const data = JSON.parse(body || '{}');
+                    data = JSON.parse(body || '{}');
+                } catch (e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body in request: ' + e.message }));
+                    return;
+                }
+
+                try {
                     const promptText = data.prompt || data.text || '';
-                    const targetUuid = data.uuid || data.chat_uuid || data.conversation_id || null;
                     const targetIdentifier = data.uuid || data.title || data.conversation || null;
 
                     if (!promptText) {
@@ -38,113 +44,39 @@ function activate(context) {
                         return;
                     }
 
-                    // 0. Targeted send: identifier (uuid or title) resolves against
-                    // trajectorySummaries and delivers straight through the backend
-                    // RPC (SendUserCascadeMessage) - bypasses the UI/picker/focus
-                    // entirely, so it works regardless of what's currently open.
+                    // Delivered straight through the backend RPC (SendUserCascadeMessage) -
+                    // bypasses the UI/focus entirely, works regardless of what's open.
+                    let match;
                     if (targetIdentifier) {
-                        try {
-                            const match = lsClient.resolveConversation(targetIdentifier);
-                            await lsClient.sendUserCascadeMessage(match.cascadeId, promptText);
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({
-                                ok: true,
-                                status: 'Prompt sent via direct RPC (SendUserCascadeMessage)',
-                                cascadeId: match.cascadeId,
-                                title: match.title
-                            }));
-                        } catch (err) {
-                            res.writeHead(400, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({
-                                ok: false,
-                                error: err.message,
-                                candidates: err.candidates
-                            }));
-                        }
-                        return;
+                        match = lsClient.resolveConversation(targetIdentifier);
+                    } else {
+                        const convs = lsClient.listConversations();
+                        if (convs.length === 0) throw new Error('No active conversations found in state DB');
+                        match = convs[0];
                     }
 
-                    // 1. Copy prompt to clipboard safely
-                    try {
-                        await vscode.env.clipboard.writeText(promptText);
-                    } catch (clipErr) {}
-
-                    // 2. Open chat view and inject query with target UUID if present
-                    let handled = false;
-                    let lastError = null;
-
-                    const targets = [];
-                    if (targetUuid) {
-                        targets.push(
-                            { cmd: 'antigravity.sendPromptToAgentPanel', arg: { prompt: promptText, conversationId: targetUuid, sessionId: targetUuid, uuid: targetUuid, id: targetUuid } },
-                            { cmd: 'antigravity.sendPromptToAgentPanel', arg: { prompt: promptText, conversationId: targetUuid } },
-                            { cmd: 'workbench.action.chat.open', arg: { query: promptText, conversationId: targetUuid, sessionId: targetUuid } }
-                        );
-                    }
-                    targets.push(
-                        { cmd: 'antigravity.sendPromptToAgentPanel', arg: promptText },
-                        { cmd: 'workbench.action.chat.open', arg: { query: promptText } },
-                        { cmd: 'workbench.action.chat.open', arg: promptText }
-                    );
-
-                    for (const t of targets) {
-                        try {
-                            await vscode.commands.executeCommand(t.cmd, t.arg);
-                            handled = true;
-                            break;
-                        } catch (e) {
-                            lastError = e.message;
-                        }
-                    }
-
-                    // 3. If direct injection didn't handle it, open/focus the agent panel safely
-                    if (!handled) {
-                        const focusTargets = [
-                            'antigravity.agentSidePanel.focus',
-                            'antigravity.openAgent',
-                            'antigravity.toggleChatFocus',
-                            'antigravity.agentSidePanel.open',
-                            'workbench.action.chat.open'
-                        ];
-
-                        for (const cmd of focusTargets) {
-                            try {
-                                await vscode.commands.executeCommand(cmd);
-                                handled = true;
-                                break;
-                            } catch (e) {}
-                        }
-                    }
-
+                    await lsClient.sendUserCascadeMessage(match.cascadeId, promptText);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({
                         ok: true,
-                        status: 'Prompt received and injected',
-                        handled,
-                        target_uuid: targetUuid
+                        status: 'Prompt sent via direct RPC (SendUserCascadeMessage)',
+                        cascadeId: match.cascadeId,
+                        title: match.title
                     }));
-
                 } catch (err) {
-                    res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: false, error: err.message }));
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                        ok: false,
+                        error: err.message,
+                        candidates: err.candidates
+                    }));
                 }
             });
-        } else if (req.method === 'GET' && pathname === '/commands') {
+        } else if (req.method === 'GET' && pathname === '/conversations') {
             try {
-                const allCmds = await vscode.commands.getCommands(true);
-                const filtered = allCmds.filter(c => 
-                    c.toLowerCase().includes('chat') || 
-                    c.toLowerCase().includes('antigravity') || 
-                    c.toLowerCase().includes('prompt') || 
-                    c.toLowerCase().includes('agent') ||
-                    c.toLowerCase().includes('conversation') ||
-                    c.toLowerCase().includes('session') ||
-                    c.toLowerCase().includes('switch') ||
-                    c.toLowerCase().includes('load') ||
-                    c.toLowerCase().includes('pick')
-                );
+                const list = lsClient.listConversations();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ok: true, commands: filtered }));
+                res.end(JSON.stringify({ ok: true, conversations: list }));
             } catch (e) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -159,8 +91,6 @@ function activate(context) {
             }
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, status: 'New conversation started' }));
-        } else if (req.method === 'POST' && (pathname === '/picker' || pathname === '/switch')) {
-            await handlePickerRequest(req, res);
         } else {
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Not Found' }));
