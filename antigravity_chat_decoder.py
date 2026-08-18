@@ -224,18 +224,12 @@ def classify_step(step_type, leaves):
     role = STEP_ROLES.get(step_type)
 
     if role == "user":
-        text = find_leaf(leaves, "f19.f2") or find_leaf(leaves, "f19.f3.f1")
+        text = find_leaf(leaves, "f19.f2", value_type="text") or find_leaf(leaves, "f19.f3.f1", value_type="text")
         return {"role": role, "text": text} if text else None
 
     if role == "assistant":
-        # f20.f1 (mirrored in f20.f8) is the reply the user actually sees; f20.f3 is
-        # the model's internal reasoning. Prefer the reply - measured on one step,
-        # f20.f3 held 342 chars of "Generating the Report" while f20.f1 held the
-        # actual 5543-char answer, so preferring f20.f3 renders thinking and drops
-        # the response. Fall back to the reasoning only when there is no reply yet,
-        # which is what a step captured mid-stream looks like.
-        answer = find_leaf(leaves, "f20.f1") or find_leaf(leaves, "f20.f8")
-        text = answer or find_leaf(leaves, "f20.f3")
+        answer = find_leaf(leaves, "f20.f1", value_type="text") or find_leaf(leaves, "f20.f8", value_type="text")
+        text = answer or find_leaf(leaves, "f20.f3", value_type="text")
         return {"role": role, "text": text} if text else None
 
     if role == "tool_call":
@@ -307,14 +301,23 @@ def flatten(fields, path="root"):
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_gemini_root(log, override=None):
-    candidates = [Path(override)] if override else [Path.home() / ".gemini" / "antigravity"]
+def discover_gemini_roots(log, override=None):
+    """Returns every existing data root, not just the first match - newer
+    Antigravity installs use `~/.gemini/antigravity-ide/` while the
+    conversation index (`agyhub_summaries_proto.pb`) and older conversations
+    may still only exist under the legacy `~/.gemini/antigravity/`. Picking
+    a single root silently drops whichever half lives in the other one."""
+    candidates = [Path(override)] if override else [
+        Path.home() / ".gemini" / "antigravity-ide",
+        Path.home() / ".gemini" / "antigravity",
+    ]
+    found = []
     for c in candidates:
         exists = c.is_dir()
         log.step(f"checking candidate Antigravity data root: {c} -> {'FOUND' if exists else 'not present'}")
         if exists:
-            return c
-    return None
+            found.append(c)
+    return found
 
 
 def discover_ide_state_dbs(log):
@@ -458,6 +461,61 @@ def decode_pb_conversation(log, pb_path):
     return {"opaque": True, "reason": "encrypted-or-unrecognized-format", "size": len(data)}
 
 
+# ---------------------------------------------------------------------------
+# Same-schema SQLite export
+# ---------------------------------------------------------------------------
+
+def decode_conversation_to_sqlite(log, db_path, out_path):
+    """Copy `db_path` into a fresh SQLite file at `out_path` with IDENTICAL
+    table and column names/schema, but every BLOB value that parses as
+    protobuf is replaced with its decoded JSON text (same column, same
+    name - SQLite has no real column-type enforcement, so a TEXT value
+    fits fine into a column declared BLOB). Values that don't parse as
+    protobuf (opaque/encrypted blobs, or blobs from an unrecognized shape)
+    are left as raw bytes untouched."""
+    if out_path.exists():
+        out_path.unlink()
+
+    src = sqlite3.connect(str(db_path))
+    src.row_factory = sqlite3.Row
+    dst = sqlite3.connect(str(out_path))
+
+    tables = src.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
+    ).fetchall()
+
+    for name, sql in tables:
+        dst.execute(sql)
+        log.step(f"[sqlite-export] created table `{name}` (verbatim schema)")
+
+    for name, _sql in tables:
+        columns = [row[1] for row in src.execute(f"PRAGMA table_info({name})").fetchall()]
+        rows = src.execute(f"SELECT * FROM {name}").fetchall()
+        decoded_count = 0
+
+        for row in rows:
+            values = []
+            for col in columns:
+                val = row[col]
+                if isinstance(val, (bytes, bytearray)):
+                    parsed = decode_message(bytes(val))
+                    if parsed:
+                        val = json.dumps(flatten(parsed), default=str, ensure_ascii=False)
+                        decoded_count += 1
+                values.append(val)
+            placeholders = ",".join("?" for _ in columns)
+            col_list = ",".join(columns)
+            dst.execute(f"INSERT INTO {name} ({col_list}) VALUES ({placeholders})", values)
+
+        log.step(f"[sqlite-export] copied {len(rows)} row(s) into `{name}` "
+                 f"({decoded_count} BLOB value(s) decoded to JSON text)")
+
+    dst.commit()
+    dst.close()
+    src.close()
+    log.step(f"[sqlite-export] wrote {out_path.resolve()}")
+
+
 def collect_brain_files(log, gemini_root, uuid):
     brain_dir = gemini_root / "brain" / uuid
     if not brain_dir.is_dir():
@@ -583,34 +641,46 @@ def render_transcript_md(summary, decoded, brain_files):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", help="override auto-detected ~/.gemini/antigravity path")
+    ap.add_argument("--root", help="override auto-detected data root (checks both antigravity-ide and antigravity by default)")
     ap.add_argument("--uuid", action="append", help="decode only this conversation uuid (repeatable)")
     ap.add_argument("--latest", type=int, help="decode only the N most recently modified conversations")
     ap.add_argument("--all", action="store_true", help="decode every conversation found")
-    ap.add_argument("--out-dir", default=".", help="output directory (default: current working directory)")
+    ap.add_argument("--out-dir", default=".", help="output directory for transcript.md/decoded_raw.json (default: current working directory)")
+    ap.add_argument("--to-sqlite", action="store_true",
+                    help="also write a same-schema SQLite file per targeted conversation "
+                         "(decoded_<uuid>.sqlite) into the current working directory, with "
+                         "BLOB columns replaced by decoded JSON text - no --uuid/--latest/--all "
+                         "needed, defaults to the single most recently modified conversation")
     ap.add_argument("--quiet", action="store_true", help="suppress live flow-log printing")
     args = ap.parse_args()
 
     log = FlowLog(quiet=args.quiet)
     log.step("=== Antigravity chat history decode started ===")
 
-    gemini_root = discover_gemini_root(log, args.root)
-    if not gemini_root:
+    gemini_roots = discover_gemini_roots(log, args.root)
+    if not gemini_roots:
         log.step("no Antigravity data directory found on this machine - nothing to decode")
         sys.exit(1)
 
     discover_ide_state_dbs(log)  # logged for transparency; not required for decoding
 
-    summaries = load_conversation_index(log, gemini_root)
-    by_uuid = {s["uuid"]: s for s in summaries}
+    summaries = []
+    by_uuid = {}
+    for root in gemini_roots:
+        for s in load_conversation_index(log, root):
+            if s["uuid"] not in by_uuid:
+                by_uuid[s["uuid"]] = s
+                summaries.append(s)
 
-    conv_dir = gemini_root / "conversations"
     on_disk = {}
-    if conv_dir.is_dir():
-        for p in conv_dir.iterdir():
-            if p.suffix in (".db", ".pb"):
-                on_disk.setdefault(p.stem, {})[p.suffix[1:]] = p
-    log.step(f"found {len(on_disk)} conversation ids under {conv_dir}")
+    for root in gemini_roots:
+        conv_dir = root / "conversations"
+        if conv_dir.is_dir():
+            for p in conv_dir.iterdir():
+                if p.suffix in (".db", ".pb"):
+                    on_disk.setdefault(p.stem, {}).setdefault(p.suffix[1:], p)
+            log.step(f"found {len(list(conv_dir.iterdir()))} entries under {conv_dir}")
+    log.step(f"{len(on_disk)} distinct conversation ids found across {len(gemini_roots)} root(s)")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -631,8 +701,13 @@ def main():
         targets = [u for u, _ in ordered[:args.latest]]
     elif args.all:
         targets = list(on_disk.keys())
+    elif args.to_sqlite:
+        # --to-sqlite alone defaults to the single most recently modified
+        # conversation, same convention as antigravity_watch.py's session picker.
+        ordered = sorted(on_disk.items(), key=lambda kv: max(p.stat().st_mtime for p in kv[1].values()), reverse=True)
+        targets = [ordered[0][0]] if ordered else []
     else:
-        log.step("no --uuid/--latest/--all given: listing only. Pass --latest 5 or --all to decode full transcripts.")
+        log.step("no --uuid/--latest/--all/--to-sqlite given: listing only. Pass --latest 5 or --all to decode full transcripts.")
         targets = []
 
     log.step(f"decoding {len(targets)} conversation(s): {targets}")
@@ -641,7 +716,11 @@ def main():
         log.step(f"--- conversation {uuid} ---")
         files = on_disk.get(uuid, {})
         summary = by_uuid.get(uuid, {"uuid": uuid})
-        brain_files = collect_brain_files(log, gemini_root, uuid)
+        brain_files = {}
+        for root in gemini_roots:
+            brain_files = collect_brain_files(log, root, uuid)
+            if brain_files:
+                break
 
         if "db" in files:
             decoded = decode_db_conversation(log, files["db"])
@@ -657,6 +736,13 @@ def main():
         (conv_out / "transcript.md").write_text(md, encoding="utf-8")
         (conv_out / "decoded_raw.json").write_text(json.dumps(decoded, default=str, indent=2), encoding="utf-8")
         log.step(f"wrote {conv_out / 'transcript.md'} and decoded_raw.json")
+
+        if args.to_sqlite:
+            if "db" not in files:
+                log.step(f"--to-sqlite: conversation {uuid} has no .db file (it's opaque .pb) - skipping sqlite export")
+            else:
+                sqlite_out = Path.cwd() / f"decoded_{uuid}.sqlite"
+                decode_conversation_to_sqlite(log, files["db"], sqlite_out)
 
     log.step("=== done ===")
     log.save(out_dir / "flow_log.txt")
