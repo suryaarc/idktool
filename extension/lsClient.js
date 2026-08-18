@@ -205,16 +205,30 @@ const DEFAULT_CASCADE_CONFIG = {
     plannerConfig: {
         conversational: { plannerMode: 'CONVERSATIONAL_PLANNER_MODE_DEFAULT', agenticMode: true },
         toolConfig: {
-            runCommand: { autoCommandConfig: { autoExecutionPolicy: 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF' } },
+            runCommand: { autoCommandConfig: { autoExecutionPolicy: 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER' } },
             notifyUser: { artifactReviewMode: 'ARTIFACT_REVIEW_MODE_ALWAYS' },
             permissionConfig: { defaultGrants: { ask: ['read_url(*)'] } }
         },
-        requestedModel: { model: 'MODEL_PLACEHOLDER_M71' },
+        requestedModel: { model: 'MODEL_PLACEHOLDER_M72' },
         ephemeralMessagesConfig: { enabled: true },
         knowledgeConfig: { enabled: true }
     },
     conversationHistoryConfig: { enabled: true }
 };
+
+// Create a new conversation. Confirmed off the wire: StartCascade itself carries
+// no cascadeConfig - just source/cascadeId/workspaceUris/requestedModel. cascadeId
+// is generated CLIENT-SIDE (crypto.randomUUID), not returned by the server.
+async function startCascade(workspaceUri) {
+    const cascadeId = require('crypto').randomUUID();
+    await rpcCall('StartCascade', {
+        source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+        cascadeId,
+        workspaceUris: [workspaceUri],
+        requestedModel: 'MODEL_PLACEHOLDER_M72'
+    });
+    return cascadeId;
+}
 
 async function sendUserCascadeMessage(cascadeId, text) {
     return rpcCall('SendUserCascadeMessage', {
@@ -227,6 +241,9 @@ async function sendUserCascadeMessage(cascadeId, text) {
 module.exports = {
     listConversations,
     resolveConversation,
+    startCascade,
     sendUserCascadeMessage,
-    rpcCall
+    rpcCall,
+    getConnectionInfo
 };
+
